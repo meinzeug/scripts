@@ -131,6 +131,8 @@ docker ps
 # Optional: Docker is running
 docker run --rm Docker works. 
 
+sudo systemctl enable docker
+sudo systemctl enable containerd
 
 # ===== Firewall =====
 log "Firewall konfigurieren"
@@ -232,6 +234,45 @@ sudo docker rm -f portainer >/dev/null 2>&1 || true
 sudo docker run -d -p "${UI_PORT}:9443" --name portainer --restart=always \
   -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
 
+
+# 1) Tools installieren
+sudo apt update
+sudo apt -y install mkcert libnss3-tools
+
+# 2) Lokale CA installieren (Root-CA wird in System- und Browser-Truststore eingetragen)
+mkcert -install
+
+# 3) Zertifikat für Host und IP erzeugen
+HOST=$(hostname -s)
+IP=$(hostname -I | awk '{print $1}')
+TMPD=$(mktemp -d)
+cd "$TMPD"
+
+mkcert -key-file portainer-key.pem -cert-file portainer-cert.pem "$HOST" "$HOST.local" "$IP"
+
+# 4) Zertifikate sicher nach /etc/portainer/certs kopieren
+sudo mkdir -p /etc/portainer/certs
+sudo install -o root -g root -m 600 portainer-key.pem /etc/portainer/certs/portainer-key.pem
+sudo install -o root -g root -m 644 portainer-cert.pem /etc/portainer/certs/portainer-cert.pem
+
+# 5) Port reservieren und Portainer mit SSL starten
+portmap release portainer-ui 2>/dev/null || true
+UI_PORT=$(portmap reserve other portainer-ui 25443 || echo 25443)
+docker rm -f portainer 2>/dev/null || true
+docker volume create portainer_data >/dev/null 2>&1 || true
+
+docker run -d \
+  -p "${UI_PORT}:9443" \
+  --name portainer \
+  --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v portainer_data:/data \
+  -v /etc/portainer/certs:/certs:ro \
+  portainer/portainer-ce:latest \
+  --sslcert /certs/portainer-cert.pem \
+  --sslkey /certs/portainer-key.pem
+
+
 # ===== Templates =====
 log "Devcontainer-Templates"
 TPL="${HOME}/.devcontainer-templates"; mkdir -p "$TPL"
@@ -276,7 +317,16 @@ fi
 
 # ===== Fertig =====
 log "Fertig"
-echo "Portainer: https://${HOSTNAME_NEW}:${UI_PORT}"
+
+UI_PORT=$(portmap reserve other portainer-ui 25443 || echo 25443)
+docker rm -f portainer 2>/dev/null || true
+docker volume create portainer_data >/dev/null 2>&1 || true
+docker run -d -p "${UI_PORT}:9443" --name portainer --restart=always \
+  -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data \
+  portainer/portainer-ce:latest
+echo "Portainer: https://$(hostname -s):${UI_PORT}"
+
+
 echo "Projekte: ${PROJ_DIR}"
 echo "Beispiel: cd ${PROJ_DIR}/<repo> && make up && make sh"
 EOF
