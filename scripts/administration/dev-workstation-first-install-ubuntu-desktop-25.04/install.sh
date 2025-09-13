@@ -116,6 +116,22 @@ if ! sudo apt -y install docker-ce docker-ce-cli containerd.io docker-buildx-plu
 fi
 sudo usermod -aG docker "$USER" || true
 
+# Docker-Daemon sicher starten
+sudo systemctl enable --now docker
+
+# User in Gruppe aufnehmen (idempotent)
+sudo usermod -aG docker "$USER"
+
+# Gruppenzugehörigkeit jetzt aktiv machen (ohne Ab-/Anmelden)
+newgrp docker
+
+# Test (soll ohne "permission denied" laufen)
+docker ps
+
+# Optional: Docker is running
+docker run --rm Docker works. 
+
+
 # ===== Firewall =====
 log "Firewall konfigurieren"
 sudo ufw default deny incoming
