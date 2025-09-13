@@ -226,42 +226,30 @@ esac
 PM
 sudo chmod +x /usr/local/bin/portmap
 
-# ===== Portainer =====
-log "Portainer starten"
-UI_PORT=$(portmap reserve other portainer-ui)
-sudo docker volume create portainer_data >/dev/null
-sudo docker rm -f portainer >/dev/null 2>&1 || true
-sudo docker run -d -p "${UI_PORT}:9443" --name portainer --restart=always \
-  -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data portainer/portainer-ce:latest
+# ===== Portainer: SSL + Admin + Stacks aus Repos =====
+log "Portainer vorbereiten (Port, SSL, Admin, Stacks)"
 
+# Port aus OTHER-Range (25000–28000) sichern
+portmap release portainer-ui 2>/dev/null || true
+UI_PORT="$(portmap reserve other portainer-ui 25443 || echo 25443)"
+HOST="$(hostname -s)"
 
-# 1) Tools installieren
-sudo apt update
+# --- mkcert installieren und lokale CA einrichten ---
 sudo apt -y install mkcert libnss3-tools
-
-# 2) Lokale CA installieren (Root-CA wird in System- und Browser-Truststore eingetragen)
 mkcert -install
 
-# 3) Zertifikat für Host und IP erzeugen
-HOST=$(hostname -s)
-IP=$(hostname -I | awk '{print $1}')
-TMPD=$(mktemp -d)
-cd "$TMPD"
-
+# Zertifikat (Host + IP) erzeugen und sicher ablegen
+IP="$(hostname -I | awk '{print $1}')"
+TMPD="$(mktemp -d)"; cd "$TMPD"
 mkcert -key-file portainer-key.pem -cert-file portainer-cert.pem "$HOST" "$HOST.local" "$IP"
-
-# 4) Zertifikate sicher nach /etc/portainer/certs kopieren
 sudo mkdir -p /etc/portainer/certs
 sudo install -o root -g root -m 600 portainer-key.pem /etc/portainer/certs/portainer-key.pem
 sudo install -o root -g root -m 644 portainer-cert.pem /etc/portainer/certs/portainer-cert.pem
 
-# 5) Port reservieren und Portainer mit SSL starten
-portmap release portainer-ui 2>/dev/null || true
-UI_PORT=$(portmap reserve other portainer-ui 25443 || echo 25443)
-docker rm -f portainer 2>/dev/null || true
-docker volume create portainer_data >/dev/null 2>&1 || true
-
-docker run -d \
+# --- Portainer Container (SSL) starten ---
+sudo docker rm -f portainer >/dev/null 2>&1 || true
+sudo docker volume create portainer_data >/dev/null 2>&1 || true
+sudo docker run -d \
   -p "${UI_PORT}:9443" \
   --name portainer \
   --restart=always \
@@ -271,6 +259,95 @@ docker run -d \
   portainer/portainer-ce:latest \
   --sslcert /certs/portainer-cert.pem \
   --sslkey /certs/portainer-key.pem
+
+# --- Warten bis API erreichbar ist ---
+PORTAINER_BASE="https://${HOST}:${UI_PORT}"
+log "Warte auf Portainer API: ${PORTAINER_BASE}"
+for i in $(seq 1 60); do
+  if curl -skf "${PORTAINER_BASE}/api/system/status" >/dev/null; then break; fi
+  sleep 1
+done
+
+# --- Admin-User initialisieren (idempotent) ---
+# Wenn bereits initialisiert, liefert der Endpoint Fehler; das ist ok.
+curl -sk -X POST "${PORTAINER_BASE}/api/users/admin/init" \
+  -H "Content-Type: application/json" \
+  -d '{"Password":"pleaseChangeMe"}' >/dev/null || true
+
+# --- Token holen ---
+TOKEN="$(curl -sk -X POST "${PORTAINER_BASE}/api/auth" \
+  -H "Content-Type: application/json" \
+  -d '{"Username":"admin","Password":"pleaseChangeMe"}' \
+  | jq -r '.jwt // .token // empty')"
+
+if [ -z "$TOKEN" ]; then
+  echo "FEHLER: Portainer-Auth fehlgeschlagen" >&2
+  exit 1
+fi
+
+# --- Endpoint-ID ermitteln (lokaler Docker-Endpunkt ist i.d.R. #1) ---
+EID="$(curl -sk "${PORTAINER_BASE}/api/endpoints" -H "Authorization: Bearer ${TOKEN}" | jq -r '.[0].Id // .[0].id // 1')"
+
+# --- Compose-Stacks für alle Repos erzeugen und per API deployen ---
+PORTAINER_STACK_DIR="${HOME}/.portainer-stacks"
+mkdir -p "${PORTAINER_STACK_DIR}"
+
+REPO_ROOT="${PROJ_DIR}/${GH_USER}"
+if [ -d "${REPO_ROOT}" ]; then
+  shopt -s nullglob
+  for repo in "${REPO_ROOT}"/*/ ; do
+    [ -d "${repo}/.git" ] || continue
+    NAME="$(basename "$repo")"
+    STACK_FILE="${PORTAINER_STACK_DIR}/${NAME}.yml"
+
+    # Port aus GitHub-Range reservieren (10000–20000)
+    GH_PORT="$(portmap reserve github "${NAME}-web" 0 2>/dev/null || echo 0)"
+
+    # Compose-Datei: Image generisch + Volume-Mount des Repos, Port-Mapping aus env
+    cat >"$STACK_FILE" <<YML
+version: "3.8"
+services:
+  ${NAME}:
+    image: debian:stable-slim
+    container_name: ${NAME}_dev
+    command: ["sleep","infinity"]
+    volumes:
+      - ${repo}:/work
+    environment:
+      - APP_PORT=\${APP_PORT:-3000}
+    ports:
+      - "\${PORT:-${GH_PORT}}:\${APP_PORT:-3000}"
+YML
+
+    # Compose-Inhalt laden
+    COMPOSE_CONTENT="$(sed 's/"/\\"/g' "$STACK_FILE")"
+
+    # Falls Stack bereits existiert: löschen (idempotent)
+    # Suche nach bestehendem Stack-Namen
+    EXIST_ID="$(curl -sk -H "Authorization: Bearer ${TOKEN}" "${PORTAINER_BASE}/api/stacks" \
+      | jq -r --arg n "$NAME" '.[] | select(.Name==$n) | .Id // .id' | head -n1)"
+    if [ -n "${EXIST_ID}" ]; then
+      curl -sk -X DELETE "${PORTAINER_BASE}/api/stacks/${EXIST_ID}?external=false" \
+        -H "Authorization: Bearer ${TOKEN}" >/dev/null || true
+    fi
+
+    # Stack per API anlegen (type=2 compose, method=string)
+    curl -sk -X POST "${PORTAINER_BASE}/api/stacks?type=2&method=string&endpointId=${EID}" \
+      -H "Authorization: Bearer ${TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{
+            \"Name\":\"${NAME}\",
+            \"ComposeFileContent\":\"${COMPOSE_CONTENT}\",
+            \"Env\": [
+              {\"name\":\"PORT\",\"value\":\"${GH_PORT}\"},
+              {\"name\":\"APP_PORT\",\"value\":\"3000\"}
+            ]
+          }" >/dev/null
+
+    echo "→ Stack deployed: ${NAME} (PORT=${GH_PORT})"
+  done
+fi
+
 
 
 # ===== Templates =====
@@ -317,16 +394,7 @@ fi
 
 # ===== Fertig =====
 log "Fertig"
-
-UI_PORT=$(portmap reserve other portainer-ui 25443 || echo 25443)
-docker rm -f portainer 2>/dev/null || true
-docker volume create portainer_data >/dev/null 2>&1 || true
-docker run -d -p "${UI_PORT}:9443" --name portainer --restart=always \
-  -v /var/run/docker.sock:/var/run/docker.sock -v portainer_data:/data \
-  portainer/portainer-ce:latest
-echo "Portainer: https://$(hostname -s):${UI_PORT}"
-
-
+echo "Portainer UI: ${PORTAINER_BASE}"
 echo "Projekte: ${PROJ_DIR}"
 echo "Beispiel: cd ${PROJ_DIR}/<repo> && make up && make sh"
 EOF
